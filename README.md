@@ -19,7 +19,7 @@ This repository serves as both:
 📧 [LinkedIn](https://www.linkedin.com/in/ibrahimsiddig) | 🐙 [GitHub](https://github.com/ibrahimssd)
 
 **Experience:**
-- 8+ months managing SLURM-based HPC clusters with A100 GPUs for 80+ researchers
+- 1.5 years + months managing SLURM-based HPC clusters with A100/H100 GPUs for 80+ researchers
 - Optimized GPU utilization from 70% → 90%+ across production workloads
 - Reduced job queue times by 35% through priority scheduling optimizations
 - Helped researchers scale from single-GPU to multi-node distributed training (4-8 nodes, 32-64 GPUs)
