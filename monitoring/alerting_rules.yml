@@ -1,0 +1,93 @@
+# monitoring/alerting_rules.yml
+# Prometheus alerting rules for distributed training jobs
+# Load with: --rule_files=monitoring/alerting_rules.yml
+
+groups:
+  - name: training_health
+    interval: 30s
+    rules:
+
+      # ── Loss divergence ───────────────────────────────────────────────────
+      - alert: TrainingLossDiverging
+        expr: training_loss_current{phase="train"} > 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Training loss is diverging"
+          description: >
+            Training loss has exceeded 10.0 for more than 5 minutes.
+            Check for learning rate issues, NaN gradients, or data problems.
+
+      - alert: TrainingLossNaN
+        expr: training_loss_current{phase="train"} != training_loss_current{phase="train"}
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NaN loss detected — training corrupted"
+          description: >
+            Loss is NaN. Training must be restarted from the last checkpoint.
+            Common causes: too-high learning rate, FP16 overflow.
+
+      # ── Throughput degradation ────────────────────────────────────────────
+      - alert: ThroughputDropped
+        expr: >
+          training_tokens_per_second
+          < 0.5 * avg_over_time(training_tokens_per_second[10m])
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Training throughput dropped by >50%"
+          description: >
+            Tokens/sec has fallen to less than half of the 10-minute average.
+            Check for GPU thermal throttling, NCCL hangs, or I/O bottlenecks.
+
+      # ── GPU utilization ───────────────────────────────────────────────────
+      - alert: GPUUnderutilized
+        expr: avg(gpu_utilization_percent) < 60
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Average GPU utilization below 60%"
+          description: >
+            GPUs are underutilized. Consider increasing batch size,
+            reducing num_workers, or profiling the dataloader pipeline.
+
+      - alert: GPUMemoryNearFull
+        expr: gpu_memory_allocated_gb / 80 > 0.92
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU memory above 92% — OOM risk"
+          description: >
+            GPU {{ $labels.gpu_id }} is using {{ $value | humanizePercentage }}
+            of its 80 GB. Reduce batch size or enable gradient checkpointing.
+
+      # ── Scaling efficiency ────────────────────────────────────────────────
+      - alert: PoorScalingEfficiency
+        expr: training_scaling_efficiency < 0.75
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Distributed training scaling efficiency below 75%"
+          description: >
+            Scaling efficiency is {{ $value | humanizePercentage }}.
+            Target is >85%. Check NCCL InfiniBand config and bucket_cap_mb.
+
+      # ── Job stalled ───────────────────────────────────────────────────────
+      - alert: TrainingStalled
+        expr: >
+          (time() - max(last_over_time(training_tokens_per_second[1m]))) > 300
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No training progress in 5 minutes — job may be hung"
+          description: >
+            No metric updates for 5 minutes. Possible NCCL deadlock or
+            process crash. Check SLURM job logs immediately.
