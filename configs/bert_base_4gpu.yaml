@@ -1,0 +1,88 @@
+# Configuration for BERT-base training on 4 GPUs
+# Based on real production workloads
+
+model:
+  name: "bert-base-uncased"
+  max_seq_length: 512
+  vocab_size: 30522
+
+training:
+  # Batch size per GPU
+  batch_size: 32
+  
+  # Total effective batch size = batch_size * num_gpus * gradient_accumulation_steps
+  # 32 * 4 * 1 = 128 (good for BERT-base)
+  gradient_accumulation_steps: 1
+  
+  learning_rate: 2e-5
+  weight_decay: 0.01
+  num_epochs: 3
+  steps_per_epoch: 1000
+  
+  # Mixed precision for memory efficiency
+  mixed_precision: "bf16"
+  
+  # Optimizer settings
+  optimizer: "adamw"
+  adam_epsilon: 1e-8
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  
+  # Learning rate scheduling
+  warmup_ratio: 0.1
+  lr_scheduler_type: "linear"
+  
+  # Logging and checkpointing
+  log_interval: 10
+  save_interval: 1
+  eval_interval: 500
+
+data:
+  dataset_size: 10000
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+
+distributed:
+  backend: "nccl"
+  
+  # DDP specific settings
+  find_unused_parameters: false
+  bucket_cap_mb: 25
+  gradient_as_bucket_view: true
+  
+  # NCCL optimizations
+  nccl_socket_ifname: "ib0"  # Use InfiniBand if available
+  nccl_ib_disable: 0
+  nccl_debug: "WARN"
+
+monitoring:
+  enable_prometheus: true
+  prometheus_port: 8000
+  
+  enable_tensorboard: true
+  tensorboard_dir: "./logs/tensorboard"
+  
+  enable_wandb: false
+  wandb_project: "distributed-training-bert"
+  
+  # Performance tracking
+  track_gpu_memory: true
+  track_throughput: true
+  track_scaling_efficiency: true
+
+checkpointing:
+  save_dir: "./checkpoints/bert_base_4gpu"
+  save_top_k: 3
+  save_every_n_epochs: 1
+  
+# Hardware-specific optimizations
+hardware:
+  # A100 40GB specific settings
+  gpu_memory_fraction: 0.95
+  enable_tf32: true  # For A100 GPUs
+  
+  # CPU settings
+  dataloader_num_workers: 8
+  cpu_count: 32
