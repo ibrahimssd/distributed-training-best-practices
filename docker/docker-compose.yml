@@ -1,0 +1,101 @@
+# Docker Compose for distributed training development
+# Simulates multi-node setup for local development
+
+version: '3.8'
+
+services:
+  # Master node
+  master:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: distributed-training-master
+    hostname: master
+    networks:
+      - training-network
+    volumes:
+      - ../:/workspace
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    environment:
+      - DISPLAY=${DISPLAY}
+      - RANK=0
+      - LOCAL_RANK=0
+      - WORLD_SIZE=2
+      - MASTER_ADDR=master
+      - MASTER_PORT=29500
+    ports:
+      - "8000:8000"  # Prometheus metrics
+      - "6006:6006"  # TensorBoard
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: tail -f /dev/null
+
+  # Worker node
+  worker1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: distributed-training-worker1
+    hostname: worker1
+    networks:
+      - training-network
+    volumes:
+      - ../:/workspace
+    environment:
+      - RANK=1
+      - LOCAL_RANK=0
+      - WORLD_SIZE=2
+      - MASTER_ADDR=master
+      - MASTER_PORT=29500
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      - master
+    command: tail -f /dev/null
+
+  # Monitoring stack
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: training-prometheus
+    networks:
+      - training-network
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: training-grafana
+    networks:
+      - training-network
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-storage:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+
+networks:
+  training-network:
+    driver: bridge
+
+volumes:
+  grafana-storage:
