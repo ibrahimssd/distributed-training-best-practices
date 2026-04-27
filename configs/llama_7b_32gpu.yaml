@@ -1,0 +1,161 @@
+# Configuration for LLaMA-7B training on 32 GPUs (4 nodes × 8 GPUs)
+# Based on real multi-node production experience
+
+model:
+  name: "meta-llama/Llama-2-7b-hf"
+  max_seq_length: 2048
+  vocab_size: 32000
+  hidden_size: 4096
+  num_attention_heads: 32
+  num_hidden_layers: 32
+
+training:
+  # Batch size per GPU (small due to model size)
+  batch_size: 4
+  
+  # Large gradient accumulation for effective batch size
+  # Effective batch size = 4 * 32 * 8 = 1024
+  gradient_accumulation_steps: 8
+  
+  learning_rate: 1e-4
+  weight_decay: 0.1
+  num_epochs: 1
+  steps_per_epoch: 5000
+  
+  # BF16 is more stable than FP16 for large models
+  mixed_precision: "bf16"
+  
+  # Optimizer settings for large models
+  optimizer: "adamw"
+  adam_epsilon: 1e-8
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  
+  # Learning rate scheduling
+  warmup_steps: 500
+  lr_scheduler_type: "cosine"
+  
+  # More frequent logging for large training runs
+  log_interval: 5
+  save_interval: 1000  # Save every 1000 steps
+  eval_interval: 1000
+  
+  # Gradient clipping for stability
+  max_grad_norm: 1.0
+
+data:
+  dataset_size: 100000
+  num_workers: 16  # More workers for larger datasets
+  pin_memory: true
+  prefetch_factor: 4
+  persistent_workers: true
+  
+  # Advanced data loading optimizations
+  shuffle_buffer_size: 10000
+  drop_last: true
+
+distributed:
+  backend: "nccl"
+  
+  # DDP settings optimized for large models
+  find_unused_parameters: false
+  bucket_cap_mb: 100  # Larger buckets for big models
+  gradient_as_bucket_view: true
+  
+  # NCCL optimizations for multi-node
+  nccl_socket_ifname: "ib0"
+  nccl_ib_disable: 0
+  nccl_debug: "WARN"
+  nccl_timeout: 1800  # 30 minutes for large model timeouts
+  nccl_async_error_handling: 1
+  
+  # Tree topology for multi-node (optimizes for InfiniBand)
+  nccl_tree_threshold: 0
+  nccl_algo: "Tree"
+
+# FSDP settings for memory efficiency
+fsdp:
+  # Full sharding across all GPUs
+  sharding_strategy: "FULL_SHARD"
+  
+  # Backward prefetch for performance
+  backward_prefetch: "BACKWARD_PRE"
+  forward_prefetch: true
+  
+  # CPU offloading for very large models (optional)
+  cpu_offload: false
+  
+  # Memory efficient attention
+  use_orig_params: false
+  
+  # Auto wrap policy
+  auto_wrap_policy: "transformer_based"
+  min_num_params: 1e6
+
+monitoring:
+  enable_prometheus: true
+  prometheus_port: 8000
+  
+  enable_tensorboard: true
+  tensorboard_dir: "./logs/tensorboard/llama_7b"
+  
+  enable_wandb: true
+  wandb_project: "distributed-training-llama-7b"
+  wandb_run_name: "llama7b_32gpu_production"
+  
+  # Comprehensive performance tracking
+  track_gpu_memory: true
+  track_throughput: true
+  track_scaling_efficiency: true
+  track_communication_overhead: true
+  
+  # Memory profiling
+  profile_memory: true
+  memory_snapshot_interval: 1000
+
+checkpointing:
+  save_dir: "./checkpoints/llama_7b_32gpu"
+  save_top_k: 5
+  save_every_n_steps: 1000
+  
+  # Async saving for large checkpoints
+  async_save: true
+  
+  # Checkpoint compression
+  compress_checkpoint: true
+
+# Hardware-specific optimizations for A100 80GB
+hardware:
+  gpu_memory_fraction: 0.90  # Leave some memory for NCCL buffers
+  enable_tf32: true
+  enable_flash_attention: true  # If available
+  
+  # CPU and memory optimizations
+  dataloader_num_workers: 16
+  cpu_count: 128  # 4 nodes × 32 cores
+  
+  # InfiniBand optimizations
+  ib_timeout: 20
+  ib_retry_count: 7
+  
+# Performance targets based on real experience
+performance:
+  target_throughput: 8400  # tokens/sec
+  target_scaling_efficiency: 0.91
+  target_gpu_utilization: 0.89
+  
+  # Memory usage targets
+  max_memory_per_gpu: 72  # GB (out of 80GB A100)
+  
+# Error handling and recovery
+resilience:
+  enable_checkpointing: true
+  checkpoint_interval: 1000
+  
+  # Automatic restart on failure
+  max_restarts: 3
+  restart_on_failure: true
+  
+  # Health checks
+  health_check_interval: 100
+  nccl_health_check: true
