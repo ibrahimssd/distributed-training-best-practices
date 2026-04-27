@@ -1,0 +1,39 @@
+# requirements.txt
+# ──────────────────────────────────────────────────────────────────────────────
+# Core dependencies for distributed DDP training
+# Install: pip install -r requirements.txt
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Deep learning framework
+torch>=2.2.0
+torchvision>=0.17.0
+
+# HuggingFace stack
+transformers>=4.40.0
+tokenizers>=0.19.0
+datasets>=2.19.0
+accelerate>=0.30.0
+peft>=0.11.0                    # LoRA / parameter-efficient fine-tuning
+
+# Flash attention (optional but recommended for long sequences)
+# Requires CUDA 11.8+ and a compatible GPU
+# flash-attn>=2.5.0
+
+# Monitoring and experiment tracking
+prometheus-client>=0.20.0
+wandb>=0.17.0
+
+# Configuration and utilities
+pyyaml>=6.0.1
+tqdm>=4.66.0
+
+# Optional: gradient compression
+# bitsandbytes>=0.43.0          # 8-bit optimizer and quantization
+
+# Testing
+pytest>=8.2.0
+pytest-mock>=3.14.0
+
+# Code quality
+black>=24.0.0
+isort>=5.13.0
