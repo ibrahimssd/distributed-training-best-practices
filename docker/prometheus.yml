@@ -1,0 +1,12 @@
+# docker/prometheus.yml
+# Prometheus scrape configuration for the DDP trainer
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "ddp_trainer"
+    static_configs:
+      - targets: ["trainer:8000"]
+    metrics_path: /metrics
