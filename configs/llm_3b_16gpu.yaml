@@ -1,0 +1,25 @@
+model:
+  name: "facebook/opt-2.7b"
+  max_seq_length: 2048
+
+training:
+  task_type: "causal_lm"
+  batch_size: 2
+  gradient_accumulation_steps: 16
+  learning_rate: 8e-5
+  num_epochs: 1
+  steps_per_epoch: 3000
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+  log_interval: 10
+  save_interval: 1
+
+data:
+  dataset_size: 30000
+  num_workers: 12
+  val_split_ratio: 0.1
+
+distributed:
+  backend: "nccl"
+  nccl_socket_ifname: "ib0"
+  nccl_ib_disable: 0

@@ -10,6 +10,7 @@ Based on real experience managing HPC infrastructure for 80+ researchers.
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -26,18 +27,21 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.multiprocessing as mp
 from torch.cuda.amp import GradScaler, autocast
 from transformers import (
-    AutoTokenizer, AutoModel, AutoConfig,
+    AutoTokenizer, AutoModelForCausalLM, AutoModelForMaskedLM, AutoConfig,
     get_linear_schedule_with_warmup
 )
 import yaml
 import wandb
 from prometheus_client import start_http_server, Counter, Histogram, Gauge
+from datasets import load_dataset
 
 # Custom utilities
 sys.path.append(str(Path(__file__).parent))
 from utils.profiling import GPUProfiler
 from utils.monitoring import setup_prometheus_metrics
 from utils.debugging import check_nccl_config, validate_distributed_setup
+from utils.gradient_checkpointing import enable_gradient_checkpointing
+from utils.config_validation import validate_training_config
 
 
 # Prometheus metrics
@@ -65,6 +69,7 @@ class DistributedTrainer:
         self.args = args
         self.device = None
         self.model = None
+        self.tokenizer = None
         self.optimizer = None
         self.scheduler = None
         self.scaler = None
@@ -85,11 +90,28 @@ class DistributedTrainer:
         
     def _setup_logging(self) -> None:
         """Configure logging to avoid duplicate messages from multiple processes."""
+        rank = self.rank
+
+        class JsonFormatter(logging.Formatter):
+            def format(self, record: logging.LogRecord) -> str:
+                payload = {
+                    "rank": rank,
+                    "level": record.levelname,
+                    "time": self.formatTime(record, self.datefmt),
+                    "message": record.getMessage(),
+                }
+                return json.dumps(payload)
+
         log_level = logging.INFO if self.rank == 0 else logging.WARNING
+        use_json_logging = self.config.get("logging", {}).get("json", False)
+        formatter = JsonFormatter() if use_json_logging else logging.Formatter(
+            f'[Rank {self.rank}] %(asctime)s - %(levelname)s - %(message)s'
+        )
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(formatter)
         logging.basicConfig(
             level=log_level,
-            format=f'[Rank {self.rank}] %(asctime)s - %(levelname)s - %(message)s',
-            handlers=[logging.StreamHandler(sys.stdout)]
+            handlers=[handler]
         )
         self.logger = logging.getLogger(__name__)
         
@@ -143,13 +165,28 @@ class DistributedTrainer:
     def setup_model(self) -> None:
         """Initialize model with proper distributed wrapping."""
         config = AutoConfig.from_pretrained(self.config['model']['name'])
-        
-        # Create model
-        self.model = AutoModel.from_pretrained(
-            self.config['model']['name'],
-            config=config,
-            torch_dtype=torch.bfloat16 if self.config['training']['mixed_precision'] == 'bf16' else torch.float32
+        model_name = self.config["model"]["name"]
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        torch_dtype = (
+            torch.bfloat16 if self.config['training']['mixed_precision'] == 'bf16' else torch.float32
         )
+        attn_impl = self.config["training"].get("attn_implementation")
+        model_kwargs = {"config": config, "torch_dtype": torch_dtype}
+        if attn_impl:
+            model_kwargs["attn_implementation"] = attn_impl
+
+        task_type = self.config.get("training", {}).get("task_type", "causal_lm")
+        if task_type == "masked_lm":
+            self.model = AutoModelForMaskedLM.from_pretrained(model_name, **model_kwargs)
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+
+        if self.config["training"].get("gradient_checkpointing", False):
+            self.model = enable_gradient_checkpointing(self.model)
         
         # Move to device before DDP wrapping
         self.model = self.model.to(self.device)
@@ -205,58 +242,97 @@ class DistributedTrainer:
         if self.rank == 0:
             self.logger.info(f"Optimizer: AdamW with LR {scaled_lr:.2e} (scaled from {base_lr:.2e})")
             
-    def setup_data(self) -> DataLoader:
-        """Setup distributed data loading with proper sampling."""
-        # Create dummy dataset for demonstration
-        # In practice, replace with your actual dataset
+    def _build_synthetic_dataset(self, size: int, seq_len: int):
         class DummyDataset:
             def __init__(self, size=10000, seq_len=512):
                 self.size = size
                 self.seq_len = seq_len
-                
+
             def __len__(self):
                 return self.size
-                
+
             def __getitem__(self, idx):
-                # Generate random input IDs and attention masks
                 input_ids = torch.randint(0, 30000, (self.seq_len,))
                 attention_mask = torch.ones(self.seq_len)
-                
                 return {
                     'input_ids': input_ids,
                     'attention_mask': attention_mask,
-                    'labels': input_ids.clone()  # For language modeling
+                    'labels': input_ids.clone()
                 }
-        
-        dataset = DummyDataset(
-            size=self.config['data']['dataset_size'],
-            seq_len=self.config['model']['max_seq_length']
+
+        return DummyDataset(size=size, seq_len=seq_len)
+
+    def setup_data(self):
+        """Setup train/validation distributed data loaders."""
+        dataset_name = self.config["data"].get("dataset_name")
+        if dataset_name:
+            try:
+                raw_dataset = load_dataset(dataset_name, split=self.config["data"].get("train_split", "train"))
+                text_field = self.config["data"].get("text_field", "text")
+
+                def tokenize_fn(batch):
+                    tokenized = self.tokenizer(
+                        batch[text_field],
+                        truncation=True,
+                        max_length=self.config["model"]["max_seq_length"],
+                        padding="max_length",
+                    )
+                    tokenized["labels"] = tokenized["input_ids"].copy()
+                    return tokenized
+
+                dataset = raw_dataset.map(
+                    tokenize_fn,
+                    batched=True,
+                    remove_columns=raw_dataset.column_names,
+                )
+                dataset.set_format(type="torch")
+            except Exception as exc:
+                if self.rank == 0:
+                    self.logger.warning(
+                        f"Failed to load dataset '{dataset_name}' ({exc}). Falling back to synthetic dataset."
+                    )
+                dataset = self._build_synthetic_dataset(
+                    size=self.config['data']['dataset_size'],
+                    seq_len=self.config['model']['max_seq_length'],
+                )
+        else:
+            dataset = self._build_synthetic_dataset(
+                size=self.config['data']['dataset_size'],
+                seq_len=self.config['model']['max_seq_length'],
+            )
+
+        total_size = len(dataset)
+        if total_size < 2:
+            train_dataset = dataset
+            val_dataset = dataset
+        else:
+            val_ratio = float(self.config["data"].get("val_split_ratio", 0.1))
+            val_size = int(total_size * val_ratio)
+            val_size = min(max(1, val_size), total_size - 1)
+            train_size = total_size - val_size
+            train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=True, drop_last=True
         )
-        
-        # Distributed sampler ensures no data duplication across processes
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=self.world_size,
-            rank=self.rank,
-            shuffle=True,
-            drop_last=True
+        val_sampler = DistributedSampler(
+            val_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=False, drop_last=False
         )
-        
-        # DataLoader with optimized settings
-        dataloader = DataLoader(
-            dataset,
-            batch_size=self.config['training']['batch_size'],
-            sampler=sampler,
-            num_workers=self.config['data']['num_workers'],
-            pin_memory=True,
-            drop_last=True,
-            persistent_workers=True if self.config['data']['num_workers'] > 0 else False
-        )
-        
+
+        common_loader_kwargs = {
+            "batch_size": self.config['training']['batch_size'],
+            "num_workers": self.config['data']['num_workers'],
+            "pin_memory": True,
+            "persistent_workers": True if self.config['data']['num_workers'] > 0 else False,
+        }
+        train_loader = DataLoader(train_dataset, sampler=train_sampler, drop_last=True, **common_loader_kwargs)
+        val_loader = DataLoader(val_dataset, sampler=val_sampler, drop_last=False, **common_loader_kwargs)
+
         if self.rank == 0:
-            self.logger.info(f"DataLoader: {len(dataset):,} samples, {len(dataloader)} batches per epoch")
-            
-        return dataloader
+            self.logger.info(
+                f"DataLoader: train={len(train_dataset):,} samples, val={len(val_dataset):,} samples"
+            )
+        return train_loader, val_loader
         
     def train_epoch(self, dataloader: DataLoader, epoch: int) -> float:
         """Train for one epoch with comprehensive monitoring."""
@@ -280,7 +356,7 @@ class DistributedTrainer:
             # Forward pass with mixed precision
             with autocast(enabled=self.config['training']['mixed_precision'] != 'fp32'):
                 outputs = self.model(**batch)
-                loss = outputs.last_hidden_state.mean()  # Dummy loss for demonstration
+                loss = outputs.loss
                 
                 # Scale loss for gradient accumulation
                 loss = loss / gradient_accumulation_steps
@@ -335,8 +411,9 @@ class DistributedTrainer:
                 
                 # GPU utilization monitoring
                 if torch.cuda.is_available():
-                    gpu_util = torch.cuda.utilization(self.device)
-                    GPU_UTILIZATION.labels(gpu_id=self.local_rank).set(gpu_util)
+                    util_fn = getattr(torch.cuda, "utilization", None)
+                    if callable(util_fn):
+                        GPU_UTILIZATION.labels(gpu_id=self.local_rank).set(util_fn(self.device))
                     
             # Memory cleanup
             if batch_idx % 100 == 0:
@@ -344,8 +421,23 @@ class DistributedTrainer:
                 
         avg_loss = total_loss / len(dataloader)
         return avg_loss
+
+    @torch.no_grad()
+    def validate_epoch(self, dataloader: DataLoader, epoch: int) -> float:
+        """Run validation for one epoch."""
+        self.model.eval()
+        total_val_loss = 0.0
+        for batch in dataloader:
+            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            with autocast(enabled=self.config['training']['mixed_precision'] != 'fp32'):
+                outputs = self.model(**batch)
+                total_val_loss += outputs.loss.item()
+        avg_val_loss = total_val_loss / max(1, len(dataloader))
+        if self.rank == 0:
+            self.logger.info(f"Epoch {epoch}: Validation loss={avg_val_loss:.4f}")
+        return avg_val_loss
         
-    def save_checkpoint(self, epoch: int, loss: float, checkpoint_dir: str) -> None:
+    def save_checkpoint(self, epoch: int, loss: float, checkpoint_dir: str, is_best: bool = False) -> None:
         """Save training checkpoint with proper distributed handling."""
         if self.rank == 0:  # Only master process saves
             checkpoint_path = Path(checkpoint_dir) / f"checkpoint_epoch_{epoch}.pt"
@@ -367,6 +459,11 @@ class DistributedTrainer:
             
             torch.save(checkpoint, checkpoint_path)
             self.logger.info(f"Checkpoint saved: {checkpoint_path}")
+            latest_path = Path(checkpoint_dir) / "checkpoint_latest.pt"
+            torch.save(checkpoint, latest_path)
+            if is_best:
+                best_path = Path(checkpoint_dir) / "checkpoint_best.pt"
+                torch.save(checkpoint, best_path)
             
     def load_checkpoint(self, checkpoint_path: str) -> int:
         """Load training checkpoint and return starting epoch."""
@@ -433,7 +530,7 @@ class DistributedTrainer:
             if self.rank == 0:
                 setup_prometheus_metrics(port=8000)
                 
-            dataloader = self.setup_data()
+            train_dataloader, val_dataloader = self.setup_data()
             
             # Resume from checkpoint if available
             start_epoch = 0
@@ -447,7 +544,8 @@ class DistributedTrainer:
                 epoch_start_time = time.time()
                 
                 # Train for one epoch
-                avg_loss = self.train_epoch(dataloader, epoch)
+                avg_loss = self.train_epoch(train_dataloader, epoch)
+                val_loss = self.validate_epoch(val_dataloader, epoch)
                 
                 # Synchronize loss across all processes
                 if self.world_size > 1:
@@ -471,13 +569,13 @@ class DistributedTrainer:
                     )
                     
                     # Save checkpoint
-                    if avg_loss < best_loss:
-                        best_loss = avg_loss
-                        self.save_checkpoint(epoch, avg_loss, self.args.output_dir)
+                    if val_loss < best_loss:
+                        best_loss = val_loss
+                        self.save_checkpoint(epoch, val_loss, self.args.output_dir, is_best=True)
                         
                     # Save regular checkpoint
                     if epoch % self.config['training']['save_interval'] == 0:
-                        self.save_checkpoint(epoch, avg_loss, self.args.output_dir)
+                        self.save_checkpoint(epoch, val_loss, self.args.output_dir)
                         
                 # Wait for all processes
                 if self.world_size > 1:
@@ -525,10 +623,18 @@ def load_config(config_path: str) -> Dict[str, Any]:
     config['training'].setdefault('log_interval', 10)
     config['training'].setdefault('save_interval', 1)
     config['training'].setdefault('mixed_precision', 'bf16')
+    config['training'].setdefault('task_type', 'causal_lm')
+    config['training'].setdefault('gradient_checkpointing', False)
     
     config.setdefault('data', {})
     config['data'].setdefault('num_workers', 8)
     config['data'].setdefault('dataset_size', 10000)
+    config['data'].setdefault('val_split_ratio', 0.1)
+
+    config.setdefault('logging', {})
+    config['logging'].setdefault('json', False)
+
+    validate_training_config(config)
     
     return config
 
