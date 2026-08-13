@@ -1,0 +1,27 @@
+model:
+  name: "meta-llama/Llama-2-13b-hf"
+  max_seq_length: 4096
+
+training:
+  task_type: "causal_lm"
+  batch_size: 1
+  gradient_accumulation_steps: 32
+  learning_rate: 8e-5
+  num_epochs: 1
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+  log_interval: 5
+
+data:
+  dataset_size: 30000
+  num_workers: 16
+
+distributed:
+  backend: "nccl"
+  nccl_socket_ifname: "ib0"
+  nccl_ib_disable: 0
+
+fsdp:
+  sharding_strategy: "FULL_SHARD"
+  backward_prefetch: "BACKWARD_PRE"
+  forward_prefetch: true

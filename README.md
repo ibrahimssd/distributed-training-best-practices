@@ -317,6 +317,8 @@ python tests/test_nccl.py --nodes=2 --gpus-per-node=4
 - **[Cluster Setup](docs/CLUSTER_SETUP.md)** - How to configure HPC infrastructure  
 - **[Case Studies](docs/CASE_STUDIES.md)** - Real-world problem solving examples
 - **[Troubleshooting](docs/TROUBLESHOOTING.md)** - Debug common issues
+- **[Benchmarks](docs/BENCHMARKS.md)** - Benchmarking methodology and reporting template
+- **[Best Practices](docs/BEST_PRACTICES.md)** - Production recommendations for stability and throughput
 
 ## 🤝 Contributing
 
