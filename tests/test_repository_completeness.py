@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 
 import yaml
@@ -40,6 +41,21 @@ def test_new_config_templates_load():
 
 def test_ddp_config_defaults_include_validation_and_logging():
     ddp_source = (REPO_ROOT / "train_ddp.py").read_text()
-    assert "setdefault('val_split_ratio', 0.1)" in ddp_source
-    assert "setdefault('json', False)" in ddp_source
-    assert "setdefault('task_type', 'causal_lm')" in ddp_source
+    tree = ast.parse(ddp_source)
+
+    found_defaults = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Attribute) or node.func.attr != "setdefault":
+            continue
+        if len(node.args) < 2:
+            continue
+        key_node = node.args[0]
+        value_node = node.args[1]
+        if isinstance(key_node, ast.Constant):
+            found_defaults.add((key_node.value, ast.unparse(value_node)))
+
+    assert ("val_split_ratio", "0.1") in found_defaults
+    assert ("json", "False") in found_defaults
+    assert ("task_type", "'causal_lm'") in found_defaults

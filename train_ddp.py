@@ -13,6 +13,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -25,7 +26,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.multiprocessing as mp
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 from transformers import (
     AutoTokenizer, AutoModelForCausalLM, AutoModelForMaskedLM, AutoConfig,
     get_linear_schedule_with_warmup
@@ -354,7 +355,7 @@ class DistributedTrainer:
                     for k, v in batch.items()}
             
             # Forward pass with mixed precision
-            with autocast(enabled=self.config['training']['mixed_precision'] != 'fp32'):
+            with torch.amp.autocast("cuda", enabled=self.config['training']['mixed_precision'] != 'fp32'):
                 outputs = self.model(**batch)
                 loss = outputs.loss
                 
@@ -427,12 +428,23 @@ class DistributedTrainer:
         """Run validation for one epoch."""
         self.model.eval()
         total_val_loss = 0.0
+        total_batches = 0
         for batch in dataloader:
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            with autocast(enabled=self.config['training']['mixed_precision'] != 'fp32'):
+            with torch.amp.autocast("cuda", enabled=self.config['training']['mixed_precision'] != 'fp32'):
                 outputs = self.model(**batch)
                 total_val_loss += outputs.loss.item()
-        avg_val_loss = total_val_loss / max(1, len(dataloader))
+                total_batches += 1
+
+        if self.world_size > 1:
+            loss_tensor = torch.tensor(total_val_loss, device=self.device)
+            count_tensor = torch.tensor(total_batches, device=self.device, dtype=torch.float32)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+            avg_val_loss = loss_tensor.item() / max(1.0, count_tensor.item())
+        else:
+            avg_val_loss = total_val_loss / max(1, total_batches)
+        self.model.train()
         if self.rank == 0:
             self.logger.info(f"Epoch {epoch}: Validation loss={avg_val_loss:.4f}")
         return avg_val_loss
@@ -460,10 +472,10 @@ class DistributedTrainer:
             torch.save(checkpoint, checkpoint_path)
             self.logger.info(f"Checkpoint saved: {checkpoint_path}")
             latest_path = Path(checkpoint_dir) / "checkpoint_latest.pt"
-            torch.save(checkpoint, latest_path)
+            shutil.copy2(checkpoint_path, latest_path)
             if is_best:
                 best_path = Path(checkpoint_dir) / "checkpoint_best.pt"
-                torch.save(checkpoint, best_path)
+                shutil.copy2(checkpoint_path, best_path)
             
     def load_checkpoint(self, checkpoint_path: str) -> int:
         """Load training checkpoint and return starting epoch."""

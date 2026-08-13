@@ -8,7 +8,6 @@ from typing import Any, Dict
 
 import torch
 import torch.distributed as dist
-from torch.cuda.amp import autocast
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -38,6 +37,7 @@ class HybridTrainer(BaseTrainer):
         self.pp_size = args.pp_size
         self.dp_size = args.dp_size
         self.tp_group = None
+        self.dp_group = None
         self.model = None
         self.optimizer = None
 
@@ -49,11 +49,20 @@ class HybridTrainer(BaseTrainer):
             tp_group_id = self.rank // self.tp_size
             tp_ranks = list(range(tp_group_id * self.tp_size, (tp_group_id + 1) * self.tp_size))
             self.tp_group = dist.new_group(tp_ranks)
+        self.dp_group = self._setup_dp_group_stub()
 
         if self.rank == 0:
             self.logger.info(
                 f"Hybrid setup initialized (tp={self.tp_size}, pp={self.pp_size}, dp={self.dp_size}, world={self.world_size})"
             )
+
+    def _setup_dp_group_stub(self):
+        """
+        Data-parallel process-group wiring placeholder.
+        Current script relies on FSDP across all ranks; this hook reserves the
+        integration point for explicit DP subgroup wiring in future iterations.
+        """
+        return None
 
     def setup_model(self) -> None:
         model_name = self.config["model"]["name"]
@@ -71,7 +80,7 @@ class HybridTrainer(BaseTrainer):
         # This placeholder keeps the script structure ready for stage-wise model partitioning.
         base_model = self._pipeline_partition_stub(base_model)
 
-        self.model = FSDP(base_model, device_id=self.local_rank, use_orig_params=False, limit_all_gathers=True)
+        self.model = FSDP(base_model, device_id=self.local_rank, use_orig_params=True, limit_all_gathers=True)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=float(self.config["training"]["learning_rate"]))
 
     def _pipeline_partition_stub(self, model: torch.nn.Module) -> torch.nn.Module:
@@ -102,7 +111,7 @@ class HybridTrainer(BaseTrainer):
             for step, batch in enumerate(dataloader):
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 self.optimizer.zero_grad(set_to_none=True)
-                with autocast(enabled=self.config["training"].get("mixed_precision", "bf16") != "fp32"):
+                with torch.amp.autocast("cuda", enabled=self.config["training"].get("mixed_precision", "bf16") != "fp32"):
                     loss = self.model(**batch).loss
                 loss.backward()
                 self.optimizer.step()

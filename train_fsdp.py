@@ -10,7 +10,7 @@ from typing import Any, Dict
 
 import torch
 import torch.distributed as dist
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     ShardingStrategy,
@@ -96,7 +96,7 @@ class FSDPTrainer(BaseTrainer):
             sharding_strategy=strategy,
             backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
             mixed_precision=mp_policy,
-            use_orig_params=False,
+            use_orig_params=True,
             limit_all_gathers=True,
         )
 
@@ -131,7 +131,7 @@ class FSDPTrainer(BaseTrainer):
             for step, batch in enumerate(dataloader):
                 batch = {k: v.to(self.device) for k, v in batch.items()}
                 self.optimizer.zero_grad(set_to_none=True)
-                with autocast(enabled=self.config["training"].get("mixed_precision", "bf16") != "fp32"):
+                with torch.amp.autocast("cuda", enabled=self.config["training"].get("mixed_precision", "bf16") != "fp32"):
                     loss = self.model(**batch).loss
                 if self.scaler.is_enabled():
                     self.scaler.scale(loss).backward()
